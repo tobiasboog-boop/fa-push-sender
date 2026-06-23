@@ -76,6 +76,40 @@ def get_actieve_configs():
             return [dict(r) for r in cur.fetchall()]
 
 
+def get_klant_namen() -> dict[int, str]:
+    """
+    Leest klantnamen uit leesinstructie in klant_analyse_config.
+    Patroon: 'Organisatie: <naam>.' of eerste zin voor ' is '.
+    """
+    sql = """
+        SELECT klantnummer, leesinstructie
+        FROM klant_analyse_config
+        WHERE leesinstructie IS NOT NULL
+        ORDER BY klantnummer
+    """
+    import re
+    namen: dict[int, str] = {}
+    with _db() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql)
+            for row in cur.fetchall():
+                kn = row["klantnummer"]
+                if kn in namen:
+                    continue
+                tekst = (row["leesinstructie"] or "").strip()
+                eerste_regel = tekst.split("\n")[0].strip()
+                m = re.match(r"Organisatie:\s*(.+)", eerste_regel)
+                if m:
+                    naam = re.sub(r"\.+$", "", m.group(1)).strip()
+                    if naam:
+                        namen[kn] = naam
+                    continue
+                m = re.match(r"(.+?)\s+is\s+", eerste_regel)
+                if m:
+                    namen[kn] = m.group(1).strip()
+    return namen
+
+
 def get_alle_analyses() -> list[dict]:
     """Geeft alle analyses terug (niet gefilterd op klant of configuratie-status)."""
     sql = """
@@ -107,7 +141,7 @@ def get_analyse_config(klantnummer: int, analyse_id: str) -> dict:
             ddv.sql_defaults,
             -- Prompt
             pv.id                       AS prompt_versie_id,
-            pv.template                 AS prompt_template,
+            pv.instruction              AS prompt_template,
             pv.model,
             pv.temperature,
             pv.max_output_tokens,
@@ -128,8 +162,10 @@ def get_analyse_config(klantnummer: int, analyse_id: str) -> dict:
           ON dd.id = a.active_dossier_definitie_id
         JOIN dossier_definitie_versies ddv
           ON ddv.id = dd.active_versie_id
+        JOIN prompts p
+          ON p.id = a.active_prompt_id
         JOIN prompt_versies pv
-          ON pv.id = a.active_prompt_id
+          ON pv.id = p.active_versie_id
         LEFT JOIN delivery_templates dt
           ON dt.id = a.active_delivery_template_id
         LEFT JOIN delivery_template_versies dtv

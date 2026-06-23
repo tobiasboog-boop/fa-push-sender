@@ -124,8 +124,19 @@ def _load_alle_analyses():
     return fa_db.get_alle_analyses()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_klant_namen_alle() -> dict:
+    try:
+        return fa_db.get_klant_namen()
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=300, show_spinner="Klantnaam ophalen...")
 def _load_klant_naam(klantnummer: int) -> str:
+    namen = _load_klant_namen_alle()
+    if klantnummer in namen:
+        return namen[klantnummer]
     try:
         return pipeline.get_klant_naam(klantnummer)
     except Exception:
@@ -207,9 +218,16 @@ if st.session_state.stap == 1:
             klanten[kn] = {"klantnummer": kn, "analyses": []}
         klanten[kn]["analyses"].append(cfg)
 
+    # Klant namen ophalen
+    klant_namen = _load_klant_namen_alle()
+
+    def _klant_label(kn: int) -> str:
+        naam = klant_namen.get(kn)
+        return f"{kn} — {naam}" if naam else str(kn)
+
     # Geconfigureerde klantnummers als dropdown-opties + "Andere klant"
     geconfigureerde_kns = sorted(klanten.keys())
-    klant_opties = [str(kn) for kn in geconfigureerde_kns] + ["Andere klant..."]
+    klant_opties = [_klant_label(kn) for kn in geconfigureerde_kns] + ["Andere klant..."]
 
     col_left, col_right = st.columns([1, 1], gap="large")
 
@@ -234,7 +252,7 @@ if st.session_state.stap == 1:
             klant_info = None
             geconfigureerde_analyse_ids = set()
         else:
-            gekozen_kn = int(gekozen_klant_label)
+            gekozen_kn = int(gekozen_klant_label.split(" — ")[0].split()[0])
             klant_info = klanten.get(gekozen_kn)
             geconfigureerde_analyse_ids = {a["analyse_id"] for a in klant_info["analyses"]} if klant_info else set()
 
@@ -294,9 +312,10 @@ if st.session_state.stap == 1:
         if st.button("Volgende →", type="primary", use_container_width=True):
             # Haal config op (met fallback op analyse-defaults als geen klant_analyse_config)
             geconfigureerde_combo = cfg_match if (klant_info and cfg_match) else None
+            resolved_naam = klant_namen.get(gekozen_kn, f"Klant {gekozen_kn}")
             st.session_state.geselecteerd = {
                 "klantnummer": gekozen_kn,
-                "klant_naam": f"Klant {gekozen_kn}",
+                "klant_naam": resolved_naam,
                 "analyse_id": str(gekozen_analyse["analyse_id"]),
                 "analyse_naam": gekozen_analyse["analyse_naam"],
                 "config": geconfigureerde_combo or {},
@@ -309,7 +328,7 @@ if st.session_state.stap == 1:
         st.subheader("Geconfigureerde klanten")
         for kn in sorted(klanten.keys()):
             k = klanten[kn]
-            with st.expander(f"Klant {kn}", expanded=(kn == gekozen_kn if gekozen_klant_label != "Andere klant..." else False)):
+            with st.expander(_klant_label(kn), expanded=(kn == gekozen_kn if gekozen_klant_label != "Andere klant..." else False)):
                 for a in k["analyses"]:
                     laatste = _format_datum(a.get("laatste_run_datum"))
                     st.markdown(
