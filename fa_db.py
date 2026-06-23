@@ -80,9 +80,9 @@ def get_alle_analyses() -> list[dict]:
     """Geeft alle actieve analyses terug (niet gefilterd op klant)."""
     sql = """
         SELECT
-            a.id   AS analyse_id,
-            a.code AS analyse_code,
-            a.naam AS analyse_naam
+            a.id::text   AS analyse_id,
+            a.code       AS analyse_code,
+            a.naam       AS analyse_naam
         FROM analyses a
         JOIN dossier_definities dd ON dd.id = a.active_dossier_definitie_id
         JOIN prompt_versies pv     ON pv.id = a.active_prompt_id

@@ -195,6 +195,10 @@ if st.session_state.stap == 1:
         st.error(f"Kan FA app DB niet bereiken: {exc}")
         st.stop()
 
+    if not alle_analyses:
+        st.error("Geen analyses gevonden in FA app DB (lege query-uitkomst).")
+        st.stop()
+
     # Geconfigureerde klanten (hebben laatste-run info)
     klanten: dict[int, dict] = {}
     for cfg in configs:
