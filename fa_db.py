@@ -77,16 +77,11 @@ def get_actieve_configs():
 
 
 def get_alle_analyses() -> list[dict]:
-    """Geeft alle actieve analyses terug (niet gefilterd op klant)."""
+    """Geeft alle analyses terug (niet gefilterd op klant of configuratie-status)."""
     sql = """
-        SELECT
-            a.id::text   AS analyse_id,
-            a.code       AS analyse_code,
-            a.naam       AS analyse_naam
-        FROM analyses a
-        JOIN dossier_definities dd ON dd.id = a.active_dossier_definitie_id
-        JOIN prompt_versies pv     ON pv.id = a.active_prompt_id
-        ORDER BY a.naam
+        SELECT id::text AS analyse_id, code AS analyse_code, naam AS analyse_naam
+        FROM analyses
+        ORDER BY naam
     """
     with _db() as con:
         with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
