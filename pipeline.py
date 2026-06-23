@@ -95,45 +95,24 @@ def _query_dwh(klantnummer: int, sql: str) -> dict:
     Voert SQL uit via de Notifica Data API.
     Retourneert {columns, rows, row_count, sql_executed}.
     """
-    import sys
-    import importlib
-
-    # Probeer de SDK te importeren (staat in notifica_app/_sdk bij lokale dev)
-    sdk_path = os.environ.get(
-        "NOTIFICA_SDK_PATH",
-        r"c:\projects\notifica_app\apps\_sdk",
-    )
-    if sdk_path not in sys.path:
-        sys.path.insert(0, sdk_path)
-
-    try:
-        notifica_sdk = importlib.import_module("notifica_sdk")
-        NotificaClient = notifica_sdk.NotificaClient
-    except ImportError as exc:
-        raise ImportError(
-            "Notifica SDK niet gevonden. Zet NOTIFICA_SDK_PATH in .env."
-        ) from exc
+    from notifica_sdk import NotificaClient
 
     data_key = os.environ.get("NOTIFICA_DATA_KEY") or os.environ.get("NOTIFICA_DWH_KEY")
     if not data_key:
         raise ValueError("NOTIFICA_DATA_KEY ontbreekt in .env")
 
     client = NotificaClient(data_key=data_key)
-    result = client.query(klantnummer, sql, max_rows=500)
+    # SDK retourneert een pandas DataFrame
+    df = client.query(klantnummer, sql, max_rows=500)
 
-    # SDK kan dict of list teruggeven — normaliseer
-    if isinstance(result, list):
-        # Oudere SDK-versie: list of dicts
-        if not result:
-            return {"columns": [], "rows": [], "row_count": 0, "sql_executed": sql}
-        columns = list(result[0].keys())
-        rows = [[row[c] for c in columns] for row in result]
-        return {"columns": columns, "rows": rows, "row_count": len(rows), "sql_executed": sql}
-    elif isinstance(result, dict):
-        result.setdefault("sql_executed", sql)
-        return result
-    else:
-        raise TypeError(f"Onverwacht type van Data API: {type(result)}")
+    columns = list(df.columns)
+    rows = df.values.tolist()
+    return {
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+        "sql_executed": sql,
+    }
 
 
 # ---------------------------------------------------------------------------
