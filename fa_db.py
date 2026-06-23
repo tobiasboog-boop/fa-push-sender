@@ -76,13 +76,29 @@ def get_actieve_configs():
             return [dict(r) for r in cur.fetchall()]
 
 
+def get_alle_analyses() -> list[dict]:
+    """Geeft alle actieve analyses terug (niet gefilterd op klant)."""
+    sql = """
+        SELECT
+            a.id   AS analyse_id,
+            a.code AS analyse_code,
+            a.naam AS analyse_naam
+        FROM analyses a
+        JOIN dossier_definities dd ON dd.id = a.active_dossier_definitie_id
+        JOIN prompt_versies pv     ON pv.id = a.active_prompt_id
+        ORDER BY a.naam
+    """
+    with _db() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql)
+            return [dict(r) for r in cur.fetchall()]
+
+
 def get_analyse_config(klantnummer: int, analyse_id: str) -> dict:
     """
-    Haalt de volledige pipeline-configuratie op voor één klant/analyse:
-    - SQL-query (incl. Jinja2-defaults en klant-overrides)
-    - LLM-prompt
-    - Delivery template (Jinja2 HTML + output-schema)
-    - Resend API-key
+    Haalt de volledige pipeline-configuratie op voor één klant/analyse.
+    klant_analyse_config is optioneel: als er geen entry bestaat worden
+    analyse-defaults gebruikt (lege sql_overrides, geen vaste ontvangers).
     """
     sql = """
         SELECT
@@ -106,7 +122,7 @@ def get_analyse_config(klantnummer: int, analyse_id: str) -> dict:
             dtv.output_schema           AS delivery_output_schema,
             dtv.email_config,
             dtv.toon_instructie,
-            -- Klantconfig
+            -- Klantconfig (optioneel — NULL als geen config bestaat)
             kac.leesinstructie,
             kac.sql_overrides,
             kac.delivery_ontvangers,
@@ -125,10 +141,9 @@ def get_analyse_config(klantnummer: int, analyse_id: str) -> dict:
           ON dtv.id = dt.active_versie_id
         LEFT JOIN delivery_methoden dm
           ON dm.code = 'email-resend'
-        JOIN klant_analyse_config kac
-          ON kac.analyse_id = a.id AND kac.klantnummer = %s
+        LEFT JOIN klant_analyse_config kac
+          ON kac.analyse_id = a.id AND kac.klantnummer = %s AND kac.enabled = true
         WHERE a.id = %s
-          AND kac.enabled = true
     """
     with _db() as con:
         with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -136,7 +151,7 @@ def get_analyse_config(klantnummer: int, analyse_id: str) -> dict:
             row = cur.fetchone()
             if not row:
                 raise ValueError(
-                    f"Geen actieve config gevonden voor klant {klantnummer} / analyse {analyse_id}"
+                    f"Analyse {analyse_id} niet gevonden of niet actief"
                 )
             return dict(row)
 
