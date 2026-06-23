@@ -236,11 +236,15 @@ if st.session_state.stap == 1:
 
         # Analyses: alle analyses (stabiele labels, onafhankelijk van klant)
         analyse_opties_map = {a["analyse_naam"]: a for a in alle_analyses}
+        analyse_labels = list(analyse_opties_map.keys())
         gekozen_analyse_naam_sel = st.selectbox(
             "Analyse",
-            list(analyse_opties_map.keys()),
-            key="analyse_select",
+            analyse_labels,
+            key="analyse_select_v2",
         )
+        # Guard: stale session state kan None opleveren
+        if not gekozen_analyse_naam_sel or gekozen_analyse_naam_sel not in analyse_opties_map:
+            gekozen_analyse_naam_sel = analyse_labels[0]
         gekozen_analyse = analyse_opties_map[gekozen_analyse_naam_sel]
 
         # Toon of combo al geconfigureerd is
