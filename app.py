@@ -234,23 +234,18 @@ if st.session_state.stap == 1:
             klant_info = klanten.get(gekozen_kn)
             geconfigureerde_analyse_ids = {a["analyse_id"] for a in klant_info["analyses"]} if klant_info else set()
 
-        # Analyses: alle analyses, met ★ voor geconfigureerde combos
-        analyse_opties_labels = []
-        analyse_opties_map = {}
-        for a in alle_analyses:
-            aid = str(a["analyse_id"])
-            prefix = "★ " if aid in geconfigureerde_analyse_ids else ""
-            label = f"{prefix}{a['analyse_naam']}"
-            analyse_opties_labels.append(label)
-            analyse_opties_map[label] = a
-
-        gekozen_analyse_label = st.selectbox(
+        # Analyses: alle analyses (stabiele labels, onafhankelijk van klant)
+        analyse_opties_map = {a["analyse_naam"]: a for a in alle_analyses}
+        gekozen_analyse_naam_sel = st.selectbox(
             "Analyse",
-            analyse_opties_labels,
+            list(analyse_opties_map.keys()),
             key="analyse_select",
-            help="★ = al geconfigureerd voor deze klant",
         )
-        gekozen_analyse = analyse_opties_map[gekozen_analyse_label]
+        gekozen_analyse = analyse_opties_map[gekozen_analyse_naam_sel]
+
+        # Toon of combo al geconfigureerd is
+        if str(gekozen_analyse["analyse_id"]) in geconfigureerde_analyse_ids:
+            st.caption("✓ Al geconfigureerd voor deze klant (standaard ontvangers beschikbaar)")
 
         # Status laatste run (alleen als geconfigureerde combo)
         laatste_run = None
