@@ -101,6 +101,21 @@ def _ensure_session():
     if tok and tok.get("access_token"):
         return
 
+    # Primair: vast refresh-token (captcha-vrij; Supabase-wachtwoordlogin is door
+    # Cloudflare Turnstile geblokkeerd voor server-side gebruik).
+    rt = os.environ.get("FA_REFRESH_TOKEN", "").strip()
+    if rt:
+        try:
+            token = fa_client.refresh(rt)
+        except FAError as exc:
+            header()
+            st.error(f"Service-sessie verlopen — vernieuw FA_REFRESH_TOKEN: {exc}")
+            st.stop()
+        st.session_state.token = token
+        st.session_state.user_email = (token.get("user") or {}).get("email", "")
+        return
+
+    # Fallback: wachtwoordlogin (werkt alleen als captcha uit staat).
     email = os.environ.get("FA_LOGIN_EMAIL", "").strip()
     pw = os.environ.get("FA_LOGIN_PASSWORD", "")
     if email and pw:
@@ -114,21 +129,8 @@ def _ensure_session():
         st.session_state.user_email = (token.get("user") or {}).get("email", email)
         return
 
-    # Fallback: vaste refresh-token uit de env
-    rt = os.environ.get("FA_REFRESH_TOKEN", "").strip()
-    if rt:
-        try:
-            token = fa_client.refresh(rt)
-        except FAError as exc:
-            header()
-            st.error(f"Service-sessie verlopen: {exc}")
-            st.stop()
-        st.session_state.token = token
-        st.session_state.user_email = (token.get("user") or {}).get("email", "")
-        return
-
     header()
-    st.error("App niet geconfigureerd: zet FA_LOGIN_EMAIL + FA_LOGIN_PASSWORD in de env.")
+    st.error("App niet geconfigureerd: zet FA_REFRESH_TOKEN in de env.")
     st.stop()
 
 
