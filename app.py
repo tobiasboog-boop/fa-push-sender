@@ -140,44 +140,64 @@ def _ms_login_component():
     (function(){
       var SUPABASE="%%SUPABASE%%", FALLBACK="%%REDIRECT%%";
       function b64(o){var s=btoa(JSON.stringify(o));return s.replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
-      function reloadApp(token){
-        var w = (window.parent && window.parent!==window) ? window.parent : window;
-        try{ var base=w.location.href.split('#')[0].split('?')[0]; w.location.replace(base+'?ms_auth='+token); return; }catch(e){}
-        try{ var t=window.top; var b=t.location.href.split('#')[0].split('?')[0]; t.location.replace(b+'?ms_auth='+token);}catch(e){}
+      // Same-origin frames waarin de Notifica-sessie kan staan
+      function stores(){ var a=[]; try{a.push(window.localStorage);}catch(e){} try{if(window.parent&&window.parent!==window)a.push(window.parent.localStorage);}catch(e){} try{if(window.top&&window.top!==window)a.push(window.top.localStorage);}catch(e){} return a; }
+      function findSession(){
+        var ss=stores();
+        for(var i=0;i<ss.length;i++){
+          try{ var raw=ss[i].getItem('notifica-auth'); if(!raw) continue;
+            var s=JSON.parse(raw);
+            var at=s.access_token||(s.currentSession&&s.currentSession.access_token);
+            var rt=s.refresh_token||(s.currentSession&&s.currentSession.refresh_token)||'';
+            var em=(s.user&&s.user.email)||(s.currentSession&&s.currentSession.user&&s.currentSession.user.email)||'';
+            if(at) return {at:at,rt:rt,em:em};
+          }catch(e){}
+        }
+        return null;
       }
-      // 1) Microsoft OAuth-redirect kwam terug (tokens in de hash)
+      function reloadApp(token){
+        // Streamlit-app (parent) of top herladen met ?ms_auth — same-origin, dus toegestaan
+        var targets=[]; try{if(window.parent&&window.parent!==window)targets.push(window.parent);}catch(e){} try{if(window.top&&window.top!==window)targets.push(window.top);}catch(e){} targets.push(window);
+        for(var i=0;i<targets.length;i++){
+          try{ var base=targets[i].location.href.split('#')[0].split('?')[0]; targets[i].location.replace(base+'?ms_auth='+token); return true; }catch(e){}
+        }
+        return false;
+      }
+      function useSession(sess){ return reloadApp(b64({access_token:sess.at,refresh_token:sess.rt})); }
+
+      // 1) Microsoft OAuth-redirect kwam terug in DIT tabblad (tokens in de hash)
       try{
-        var w=(window.parent&&window.parent!==window)?window.parent:window;
-        var h=w.location.hash||window.location.hash||'';
+        var hw=(window.parent&&window.parent!==window)?window.parent:window;
+        var h=''; try{h=hw.location.hash||'';}catch(e){h=window.location.hash||'';}
         if(h.indexOf('access_token=')>=0){
           var p=new URLSearchParams(h.substring(1));
           var at=p.get('access_token'), rt=p.get('refresh_token')||'';
           if(at){ reloadApp(b64({access_token:at,refresh_token:rt})); return; }
         }
       }catch(e){}
+
       // 2) Bestaande Notifica-sessie (Microsoft) hergebruiken
-      try{
-        var raw=window.localStorage.getItem('notifica-auth');
-        if(raw){
-          var s=JSON.parse(raw);
-          var at=s.access_token||(s.currentSession&&s.currentSession.access_token);
-          var rt=s.refresh_token||(s.currentSession&&s.currentSession.refresh_token)||'';
-          var em=(s.user&&s.user.email)||(s.currentSession&&s.currentSession.user&&s.currentSession.user.email)||'';
-          if(at){
-            var b=document.getElementById('reuse');
-            document.getElementById('em').textContent=em||'je Microsoft-account';
-            b.style.display='block';
-            b.onclick=function(){ reloadApp(b64({access_token:at,refresh_token:rt})); };
-          }
-        }
-      }catch(e){}
-      // 3) Verse Microsoft-login (opent op topniveau; nodig buiten een bestaande sessie)
+      var sess=findSession();
+      if(sess){
+        var b=document.getElementById('reuse');
+        document.getElementById('em').textContent=sess.em||'je Microsoft-account';
+        b.style.display='block';
+        b.onclick=function(){ if(!useSession(findSession()||sess)) document.getElementById('hint').textContent='Kon de sessie niet doorgeven — gebruik e-mail/wachtwoord.'; };
+      }
+
+      // 3) Verse Microsoft-login: opent in NIEUW TABBLAD (Microsoft kan niet in een iframe)
       document.getElementById('mslogin').onclick=function(){
-        var rt;
-        try{ rt=window.top.location.href.split('#')[0].split('?')[0]; }catch(e){ rt=FALLBACK; }
+        var rt; try{ rt=window.top.location.href.split('#')[0].split('?')[0]; }catch(e){ rt=FALLBACK; }
         if(!rt) rt=FALLBACK;
         var url=SUPABASE+'/auth/v1/authorize?provider=azure&redirect_to='+encodeURIComponent(rt);
-        try{ window.top.location.href=url; }catch(e){ window.location.href=url; }
+        window.open(url,'_blank');
+        document.getElementById('hint').textContent='Microsoft opent in een nieuw tabblad. Log daar in; hier verschijnt dan automatisch een knop om door te gaan.';
+        // Poll op de nieuw verkregen sessie (max ~2 min)
+        var tries=0, iv=setInterval(function(){
+          tries++; var s=findSession();
+          if(s){ clearInterval(iv); useSession(s); }
+          else if(tries>80){ clearInterval(iv); }
+        },1500);
       };
     })();
     </script>
