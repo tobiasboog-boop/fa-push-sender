@@ -33,22 +33,6 @@ TEST_ADRES = "info@notifica.nl"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def klant_naam(leesinstructie: str | None) -> str:
-    """Leid de organisatienaam af uit de leesinstructie."""
-    tekst = (leesinstructie or "").strip()
-    if not tekst:
-        return ""
-    eerste = tekst.split("\n")[0].strip()
-    m = re.match(r"Organisatie:\s*(.+)", eerste)
-    if m:
-        # Strip precies één afsluitende punt (behoudt 'B.V.')
-        return re.sub(r"\.\s*$", "", m.group(1)).strip()
-    m = re.match(r"(.+?)\s+is\s+", eerste)
-    if m:
-        return m.group(1).strip()
-    return ""
-
-
 def ontvangers_tekst(ontvangers: list) -> str:
     if not ontvangers:
         return ""
@@ -138,27 +122,16 @@ def _ensure_session():
 # Data laden (gecached per sessie)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300, show_spinner="Klanten en analyses ophalen...")
-def _laad_klant_overzicht(_token_access: str):
-    """Bouw {klantnummer: {naam, analyses:[{id,code,naam}]}} uit de FA-config.
-    `_token_access` zit in de cache-key zodat een nieuwe login vers laadt."""
-    client = _client()
-    analyses = [a for a in client.list_all_analyses() if a.get("is_active")]
-    klanten: dict[int, dict] = {}
-    for a in analyses:
-        for r in client.klanten_voor_analyse(a["id"]):
-            if not r.get("enabled"):
-                continue
-            kn = r["klantnummer"]
-            entry = klanten.setdefault(kn, {"klantnummer": kn, "naam": "", "analyses": []})
-            entry["analyses"].append({"id": a["id"], "code": a["code"], "naam": a["naam"]})
-            if not entry["naam"]:
-                naam = klant_naam(r.get("leesinstructie"))
-                if naam:
-                    entry["naam"] = naam
-    for entry in klanten.values():
-        entry["analyses"].sort(key=lambda x: x["naam"])
-    return klanten
+@st.cache_data(ttl=600, show_spinner="Klanten ophalen...")
+def _laad_organisaties(_token_access: str) -> list[dict]:
+    """Alle actieve organisaties (klantnummer + autoritatieve naam) uit Supabase."""
+    return _client().list_organizations()
+
+
+@st.cache_data(ttl=120, show_spinner="Analyses voor klant ophalen...")
+def _laad_klant_config(_token_access: str, klantnummer: int) -> list[dict]:
+    """Per actieve analyse: enabled, ontvangers, leesinstructie voor deze klant."""
+    return _client().klant_config(klantnummer)
 
 
 def _client() -> FAClient:
@@ -173,26 +146,36 @@ def klant_label(kn: int, naam: str) -> str:
 # Uitvoering: (tijdelijk ontvangers zetten →) run → deliver → verzenden
 # ---------------------------------------------------------------------------
 
-def voer_uit(*, client: FAClient, klantnummer: int, analyse: dict,
-             cfg_rij: dict, doel_emails: list[str] | None):
-    """Draait de analyse en verstuurt. doel_emails=None → standaard ontvangers.
-    Bij een override zetten we delivery_ontvangers tijdelijk en herstellen daarna."""
+def voer_uit(*, client: FAClient, klantnummer: int, analyse: dict, cfg_rij: dict,
+             doel_emails: list[str] | None, leesinstructie: str | None,
+             permanent: bool):
+    """Draait de analyse en verstuurt.
+
+    - doel_emails=None  → gebruik de bestaande config-ontvangers ongewijzigd.
+    - doel_emails=[...]  → stel die ontvangers in (en enable de combo).
+    - permanent=False    → config-wijziging na afloop terugdraaien (test / eenmalige override).
+    - permanent=True     → config-wijziging behouden (activatie van een nieuwe combo).
+    """
     analyse_id = analyse["id"]
-    origineel = cfg_rij.get("delivery_ontvangers") or []
+    orig_ontv = cfg_rij.get("delivery_ontvangers") or []
+    orig_enabled = bool(cfg_rij.get("enabled", False))
+    orig_lees = cfg_rij.get("leesinstructie")
     moet_herstellen = False
 
     status = st.status("Bezig...", expanded=True)
     try:
-        if doel_emails is not None:
-            status.write(f"✉️ Ontvangers tijdelijk instellen: {', '.join(doel_emails)}")
+        # Config aanraken als we ontvangers zetten en/of de combo nog niet aan staat
+        if doel_emails is not None or not orig_enabled:
+            actie = "activeren + ontvangers instellen" if not orig_enabled else "ontvangers instellen"
+            status.write(f"✉️ {actie}: {', '.join(doel_emails) if doel_emails else '(bestaand)'}")
             client.set_klant_config(
                 klantnummer=klantnummer, analyse_id=analyse_id,
-                enabled=bool(cfg_rij.get("enabled", True)),
-                leesinstructie=cfg_rij.get("leesinstructie"),
+                enabled=True,
+                leesinstructie=leesinstructie if leesinstructie is not None else orig_lees,
                 sql_overrides=cfg_rij.get("sql_overrides"),
-                delivery_ontvangers=maak_ontvangers(doel_emails),
+                delivery_ontvangers=(maak_ontvangers(doel_emails) if doel_emails is not None else orig_ontv),
             )
-            moet_herstellen = True
+            moet_herstellen = not permanent
 
         status.write("📥 Analyse draaien (DWH + Claude)... dit duurt ~1 min")
         run = client.run(klantnummer, analyse["code"])
@@ -222,14 +205,14 @@ def voer_uit(*, client: FAClient, klantnummer: int, analyse: dict,
             try:
                 client.set_klant_config(
                     klantnummer=klantnummer, analyse_id=analyse_id,
-                    enabled=bool(cfg_rij.get("enabled", True)),
-                    leesinstructie=cfg_rij.get("leesinstructie"),
+                    enabled=orig_enabled,
+                    leesinstructie=orig_lees,
                     sql_overrides=cfg_rij.get("sql_overrides"),
-                    delivery_ontvangers=origineel,
+                    delivery_ontvangers=orig_ontv,
                 )
             except Exception as exc:  # noqa: BLE001
-                st.warning(f"Let op: standaard ontvangers terugzetten mislukte ({exc}). "
-                           f"Controleer de klant-config in de FA-app.")
+                st.warning(f"Let op: de klant-config terugzetten mislukte ({exc}). "
+                           f"Controleer 'm in de FA-app.")
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +228,7 @@ def hoofdscherm():
         st.caption(f"Service: {st.session_state.get('user_email','?')}")
 
     try:
-        klanten = _laad_klant_overzicht(client.access_token)
+        orgs = _laad_organisaties(client.access_token)
     except FAError as exc:
         st.error(f"Kan FA-gegevens niet laden: {exc}")
         if "403" in str(exc):
@@ -253,50 +236,77 @@ def hoofdscherm():
                     "Vraag Mark om `is_notifica_employee`.")
         return
 
-    if not klanten:
-        st.warning("Geen geconfigureerde klanten gevonden.")
+    if not orgs:
+        st.warning("Geen organisaties gevonden.")
         return
+
+    naam_map = {o["klantnummer"]: o["naam"] for o in orgs}
+    kns = [o["klantnummer"] for o in orgs]
 
     st.subheader("1 — Klant en analyse")
     col_l, col_r = st.columns([1, 1], gap="large")
 
     with col_l:
-        kns = sorted(klanten.keys())
         keuze = st.selectbox(
-            "Klant",
-            kns,
-            format_func=lambda kn: klant_label(kn, klanten[kn]["naam"]),
+            "Klant", kns,
+            format_func=lambda kn: klant_label(kn, naam_map.get(kn, "")),
+            help="Alle organisaties — ook klanten waarvoor een analyse nog niet is geactiveerd.",
         )
-        klant = klanten[keuze]
-        analyse_opties = klant["analyses"]
-        analyse_naam = st.selectbox(
-            "Analyse",
-            [a["naam"] for a in analyse_opties],
-        )
-        analyse = next(a for a in analyse_opties if a["naam"] == analyse_naam)
+        # Alle actieve analyses + of ze al aan staan voor deze klant
+        cfg = _laad_klant_config(client.access_token, keuze)
+        if not cfg:
+            st.warning("Geen analyses beschikbaar.")
+            return
 
-    # Config-rij (ontvangers + leesinstructie + sql_overrides) voor deze combo
-    cfg = client.klant_config(keuze)
-    cfg_rij = next((r for r in cfg if str(r.get("analyse_id")) == str(analyse["id"])), {})
+        def _analyse_label(r):
+            return f"{r['analyse_naam']}  ✓" if r.get("enabled") else r["analyse_naam"]
+
+        cfg_rij = st.selectbox(
+            "Analyse", cfg,
+            format_func=_analyse_label,
+            help="✓ = al geactiveerd voor deze klant. Anders wordt 'ie bij versturen aangemaakt.",
+        )
+        analyse = {"id": cfg_rij["analyse_id"], "code": cfg_rij["analyse_code"],
+                   "naam": cfg_rij["analyse_naam"]}
+
+    enabled = bool(cfg_rij.get("enabled"))
     standaard = cfg_rij.get("delivery_ontvangers") or []
 
     with col_r:
-        st.markdown("**Standaard ontvangers** (uit de FA-config)")
-        if standaard:
-            for o in standaard:
-                st.code(o.get("email", ""), language=None)
+        if enabled:
+            st.markdown("**Standaard ontvangers** (uit de FA-config)")
+            if standaard:
+                for o in standaard:
+                    st.code(o.get("email", ""), language=None)
+            else:
+                st.caption("Geen standaard ontvangers ingesteld — vul hieronder een adres in.")
         else:
-            st.caption("Geen standaard ontvangers ingesteld — vul hieronder een adres in.")
+            st.info("Deze analyse is **nog niet geactiveerd** voor deze klant. "
+                    "Bij 'Uitvoeren & Versturen' wordt 'ie aangemaakt (geactiveerd) "
+                    "met de ontvangers die je hieronder invult.")
+
+    # Leesinstructie alleen bij een nieuwe (nog niet geactiveerde) combo
+    leesinstructie_nieuw = None
+    if not enabled:
+        leesinstructie_nieuw = st.text_input(
+            "Organisatie-context voor de analyse (leesinstructie)",
+            value=f"Organisatie: {naam_map.get(keuze,'')}.",
+            help="Komt in de prompt; de organisatienaam wordt het onderwerp van de mail.",
+        )
 
     st.divider()
     st.subheader("2 — Verzenden")
 
-    st.markdown("**Vervangende ontvangers** (optioneel)")
-    st.caption(
-        "Leeg laten → de **standaard ontvangers** hierboven. "
-        "Ingevuld → wij sturen **alleen** naar deze adressen (de config wordt "
-        "tijdelijk aangepast en daarna teruggezet)."
-    )
+    st.markdown("**Ontvangers**" if not enabled else "**Vervangende ontvangers** (optioneel)")
+    if enabled:
+        st.caption(
+            "Leeg laten → de **standaard ontvangers** hierboven. "
+            "Ingevuld → wij sturen **alleen** naar deze adressen (de config wordt "
+            "tijdelijk aangepast en daarna teruggezet)."
+        )
+    else:
+        st.caption("Vul de ontvanger(s) in. Deze worden de standaard ontvangers van de "
+                   "nieuwe klant-analyse.")
     override_raw = st.text_area(
         "E-mailadressen (één per regel of komma-gescheiden)",
         placeholder="contactpersoon@klant.nl",
@@ -309,6 +319,8 @@ def hoofdscherm():
 
     if definitief:
         st.success(f"Wordt verzonden naar: {', '.join(definitief)}")
+    elif not enabled:
+        st.error("Vul minimaal één ontvanger in (de combinatie wordt nieuw aangemaakt).")
     else:
         st.error("Geen ontvangers — vul minimaal één adres in.")
 
@@ -316,22 +328,27 @@ def hoofdscherm():
     with col_test:
         test_klik = st.button(f"🧪 Testmail → {TEST_ADRES}", use_container_width=True)
     with col_go:
-        go_klik = st.button("🚀 Uitvoeren & Versturen", type="primary",
+        go_label = "🚀 Activeren & Versturen" if not enabled else "🚀 Uitvoeren & Versturen"
+        go_klik = st.button(go_label, type="primary",
                             use_container_width=True, disabled=not definitief)
 
     if test_klik or go_klik:
         if test_klik:
-            doel = [TEST_ADRES]
+            doel, permanent = [TEST_ADRES], False
+        elif not enabled:
+            doel, permanent = override, True            # activatie: permanent
         else:
-            # Override → die adressen; anders standaard (doel=None laat backend de config gebruiken)
-            doel = override if override else None
+            doel, permanent = (override or None), False  # eenmalige override of standaard
         try:
             result = voer_uit(client=client, klantnummer=keuze, analyse=analyse,
-                              cfg_rij=cfg_rij, doel_emails=doel)
+                              cfg_rij=cfg_rij, doel_emails=doel,
+                              leesinstructie=leesinstructie_nieuw, permanent=permanent)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Fout: {exc}")
             return
 
+        if go_klik and not enabled:
+            _laad_klant_config.clear()  # combo is nu geactiveerd → cache verversen
         st.success(f"✅ Verzonden naar {result['to']}")
         with st.expander("E-mail preview", expanded=True):
             st.caption(f"Onderwerp: {result['payload'].get('subject','—')}")

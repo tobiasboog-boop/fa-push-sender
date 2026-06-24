@@ -11,6 +11,7 @@ Geen DWH-key, Claude-key of Resend-key meer nodig in deze app.
 from __future__ import annotations
 
 import os
+import re
 import time
 import base64
 import json
@@ -143,6 +144,32 @@ class FAClient:
             except Exception:
                 return {"raw": r.text}
         return {}
+
+    # -- organisaties (Supabase) -------------------------------------------
+    def list_organizations(self) -> list[dict]:
+        """Alle actieve organisaties met klantnummer (autoritatieve namen),
+        gelezen uit Supabase — zoals de React-app dat doet."""
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/organizations",
+            headers={"apikey": SUPABASE_ANON_KEY,
+                     "Authorization": f"Bearer {self.access_token}"},
+            params={"select": "client_id,name,is_active",
+                    "client_id": "not.is.null", "order": "client_id"},
+            timeout=30,
+        )
+        if not r.ok:
+            raise FAError(f"Organisaties ophalen mislukt: HTTP {r.status_code}: {r.text[:200]}")
+        out = []
+        for o in r.json():
+            if not o.get("is_active"):
+                continue
+            try:
+                kn = int(str(o["client_id"]).strip())
+            except (ValueError, TypeError):
+                continue
+            naam = re.sub(r"^\d+\s*-\s*", "", (o.get("name") or "").strip())
+            out.append({"klantnummer": kn, "naam": naam})
+        return out
 
     # -- analyses & klanten -------------------------------------------------
     def list_all_analyses(self) -> list[dict]:
