@@ -176,6 +176,26 @@ class FAClient:
         """Alle analyses (admin) — id, code, naam, is_active."""
         return self._req("GET", "/api/fa/admin/analyses").get("analyses", [])
 
+    def runnable_analyse_ids(self) -> set:
+        """IDs van analyses die daadwerkelijk uitvoerbaar zijn: de actieve
+        data-definitie heeft een actieve versie (met query_sql). Analyses zonder
+        data-definitie (lege schillen) vallen af — een run zou met HTTP 400 falen."""
+        out: set = set()
+        for a in self.list_all_analyses():
+            if not a.get("is_active"):
+                continue
+            add = a.get("active_data_definitie_id")
+            if not add:
+                continue
+            dds = self._req(
+                "GET", "/api/fa/admin/data-definities",
+                params={"analyse_id": a["id"]},
+            ).get("data_definities", [])
+            active_dd = next((d for d in dds if str(d["id"]) == str(add)), None)
+            if active_dd and active_dd.get("active_versie_id"):
+                out.add(str(a["id"]))
+        return out
+
     def klanten_voor_analyse(self, analyse_id: str) -> list[dict]:
         """Klant_analyse_config rijen voor één analyse (klantnummer, enabled, leesinstructie)."""
         return self._req(

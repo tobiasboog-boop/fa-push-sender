@@ -134,6 +134,12 @@ def _laad_klant_config(_token_access: str, klantnummer: int) -> list[dict]:
     return _client().klant_config(klantnummer)
 
 
+@st.cache_data(ttl=600, show_spinner="Uitvoerbare analyses bepalen...")
+def _laad_runnable(_token_access: str) -> list:
+    """IDs van analyses die echt uitvoerbaar zijn (actieve data-definitie+versie)."""
+    return list(_client().runnable_analyse_ids())
+
+
 def _client() -> FAClient:
     return FAClient(st.session_state.token)
 
@@ -252,10 +258,13 @@ def hoofdscherm():
             format_func=lambda kn: klant_label(kn, naam_map.get(kn, "")),
             help="Alle organisaties — ook klanten waarvoor een analyse nog niet is geactiveerd.",
         )
-        # Alle actieve analyses + of ze al aan staan voor deze klant
-        cfg = _laad_klant_config(client.access_token, keuze)
+        # Alle actieve analyses + of ze al aan staan voor deze klant,
+        # gefilterd op analyses die echt uitvoerbaar zijn (data-definitie aanwezig)
+        runnable = set(_laad_runnable(client.access_token))
+        cfg_all = _laad_klant_config(client.access_token, keuze)
+        cfg = [r for r in cfg_all if str(r.get("analyse_id")) in runnable]
         if not cfg:
-            st.warning("Geen analyses beschikbaar.")
+            st.warning("Geen uitvoerbare analyses beschikbaar voor deze klant.")
             return
 
         def _analyse_label(r):
