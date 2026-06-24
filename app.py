@@ -1,567 +1,336 @@
 """
 Notifica — Financiële Analyse Sender
-Streamlit-app waarmee Arthur zelfstandig analyses kan uitvoeren en versturen.
+=====================================
+Dunne UI waarmee Arthur zelfstandig analyses kan draaien én versturen.
+
+Alle zware logica (DWH-snapshot, Claude-analyse, e-mail/Resend) zit al in
+Mark's financiele-analyse backend in de notifica-app. Deze app roept die
+endpoints aan met een Supabase-employee-JWT (zelfde auth als de FA-React-app).
 """
-import json
-import os
-from datetime import datetime, timezone
+import re
+import time
 
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()
+import fa_client
+from fa_client import FAClient, FAError
 
-# ---------------------------------------------------------------------------
-# Pagina-config (altijd als eerste Streamlit-call)
-# ---------------------------------------------------------------------------
+load_dotenv()
 
 st.set_page_config(
     page_title="Analyse Sender — Notifica",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# ---------------------------------------------------------------------------
-# Wachtwoordbeveiliging
-# ---------------------------------------------------------------------------
-
-def _check_password() -> bool:
-    expected = os.environ.get("APP_PASSWORD", "")
-    if not expected:
-        return True  # geen wachtwoord ingesteld = open (dev-modus)
-
-    if st.session_state.get("authenticated"):
-        return True
-
-    with st.container():
-        st.markdown(
-            """
-            <div style="max-width:400px;margin:80px auto;text-align:center">
-              <h2>🔒 Notifica Analyse Sender</h2>
-              <p style="color:#666">Intern hulpmiddel — voer het wachtwoord in</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        col_l, col_m, col_r = st.columns([1, 2, 1])
-        with col_m:
-            pwd = st.text_input("Wachtwoord", type="password", label_visibility="collapsed",
-                                placeholder="Wachtwoord")
-            if st.button("Inloggen", use_container_width=True, type="primary"):
-                if pwd == expected:
-                    st.session_state.authenticated = True
-                    st.rerun()
-                else:
-                    st.error("Onjuist wachtwoord")
-    return False
-
-
-if not _check_password():
-    st.stop()
-
-
-# ---------------------------------------------------------------------------
-# Imports (pas na login, zodat DB-errors de login niet blokkeren)
-# ---------------------------------------------------------------------------
-
-import fa_db
-import pipeline
-import mailer
+NAVY = "#16136F"
+TEST_ADRES = "info@notifica.nl"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _format_datum(dt) -> str:
-    if dt is None:
-        return "—"
-    if hasattr(dt, "astimezone"):
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-    delta = datetime.utcnow() - dt
-    days = delta.days
-    if days == 0:
-        return "vandaag"
-    if days == 1:
-        return "gisteren"
-    return f"{days} dagen geleden ({dt.strftime('%d-%m-%Y')})"
+def klant_naam(leesinstructie: str | None) -> str:
+    """Leid de organisatienaam af uit de leesinstructie."""
+    tekst = (leesinstructie or "").strip()
+    if not tekst:
+        return ""
+    eerste = tekst.split("\n")[0].strip()
+    m = re.match(r"Organisatie:\s*(.+)", eerste)
+    if m:
+        # Strip precies één afsluitende punt (behoudt 'B.V.')
+        return re.sub(r"\.\s*$", "", m.group(1)).strip()
+    m = re.match(r"(.+?)\s+is\s+", eerste)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
-def _parse_ontvangers(config: dict) -> list[str]:
-    raw = config.get("delivery_ontvangers")
-    if not raw:
-        return []
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            return [e.strip() for e in raw.split(",") if e.strip()]
-    if isinstance(raw, list):
-        result = []
-        for item in raw:
-            if isinstance(item, dict):
-                result.append(item.get("email", ""))
-            else:
-                result.append(str(item))
-        return [e for e in result if e]
-    if isinstance(raw, dict):
-        return raw.get("to", [])
-    return []
+def ontvangers_tekst(ontvangers: list) -> str:
+    if not ontvangers:
+        return ""
+    return ", ".join(o.get("email", "") for o in ontvangers if o.get("email"))
+
+
+def parse_emails(raw: str) -> list[str]:
+    parts = re.split(r"[\n,;]+", raw or "")
+    return [p.strip() for p in parts if p.strip()]
+
+
+def maak_ontvangers(emails: list[str]) -> list[dict]:
+    return [{"rol": "to", "email": e} for e in emails]
+
+
+def header():
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <div style="background:linear-gradient(135deg,{NAVY} 0%,#3636A2 100%);
+                      width:40px;height:40px;border-radius:10px;
+                      display:flex;align-items:center;justify-content:center">
+            <svg fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24"
+                 width="20" height="20">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+            </svg>
+          </div>
+          <div>
+            <h1 style="margin:0;font-size:1.4rem;color:{NAVY}">Notifica &mdash; Analyse Sender</h1>
+            <p style="margin:0;color:#666;font-size:0.85rem">
+              Draai een financiële analyse en verstuur 'm naar de klant
+            </p>
+          </div>
+        </div>
+        <hr style="margin:0 0 24px 0;border:none;border-top:1px solid #eee">
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Login (Supabase — zelfde account als de financiele-analyse app)
+# ---------------------------------------------------------------------------
+
+def login_scherm():
+    header()
+    col_l, col_m, col_r = st.columns([1, 1.4, 1])
+    with col_m:
+        st.markdown(f"<h3 style='color:{NAVY}'>🔒 Inloggen</h3>", unsafe_allow_html=True)
+        st.caption("Log in met je Notifica-account (zelfde als app.notifica.nl).")
+        email = st.text_input("E-mailadres", placeholder="arthur@notifica.nl")
+        wachtwoord = st.text_input("Wachtwoord", type="password")
+        if st.button("Inloggen", type="primary", use_container_width=True):
+            if not email or not wachtwoord:
+                st.error("Vul e-mailadres en wachtwoord in.")
+                return
+            try:
+                token = fa_client.login(email.strip(), wachtwoord)
+            except FAError as exc:
+                st.error(str(exc))
+                return
+            st.session_state.token = token
+            st.session_state.user_email = (token.get("user") or {}).get("email", email.strip())
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
 # Data laden (gecached per sessie)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=120, show_spinner="Configuraties ophalen...")
-def _load_configs():
-    return fa_db.get_actieve_configs()
-
-
-@st.cache_data(ttl=300, show_spinner="Analyses ophalen...")
-def _load_alle_analyses():
-    return fa_db.get_alle_analyses()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_klant_namen_alle() -> dict:
-    try:
-        return fa_db.get_klant_namen()
-    except Exception:
-        return {}
-
-
-@st.cache_data(ttl=300, show_spinner="Klantnaam ophalen...")
-def _load_klant_naam(klantnummer: int) -> str:
-    namen = _load_klant_namen_alle()
-    if klantnummer in namen:
-        return namen[klantnummer]
-    try:
-        return pipeline.get_klant_naam(klantnummer)
-    except Exception:
-        return f"Klant {klantnummer}"
-
-
-# ---------------------------------------------------------------------------
-# Navigatie / sessiestatus
-# ---------------------------------------------------------------------------
-
-def _init_state():
-    defaults = {
-        "stap": 1,          # 1=selectie, 2=ontvangers+bevestiging, 3=resultaat
-        "geselecteerd": None,
-        "run_result": None,
-        "mail_result": None,
-        "error": None,
-        "test_verstuurd": False,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-
-_init_state()
-
-
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-
-st.markdown(
-    """
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
-      <div style="background:linear-gradient(135deg,#16136F 0%,#3636A2 100%);
-                  width:40px;height:40px;border-radius:10px;
-                  display:flex;align-items:center;justify-content:center">
-        <svg fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24"
-             width="20" height="20">
-          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-        </svg>
-      </div>
-      <div>
-        <h1 style="margin:0;font-size:1.4rem;color:#16136F">
-          Notifica &mdash; Analyse Sender
-        </h1>
-        <p style="margin:0;color:#666;font-size:0.85rem">
-          Voer financiële analyses uit en verstuur ze naar klanten
-        </p>
-      </div>
-    </div>
-    <hr style="margin:0 0 24px 0;border:none;border-top:1px solid #eee">
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ---------------------------------------------------------------------------
-# Stap 1 — Selectie
-# ---------------------------------------------------------------------------
-
-if st.session_state.stap == 1:
-    try:
-        configs = _load_configs()
-        alle_analyses = _load_alle_analyses()
-    except Exception as exc:
-        st.error(f"Kan FA app DB niet bereiken: {exc}")
-        st.stop()
-
-    if not alle_analyses:
-        st.error("Geen analyses gevonden in FA app DB (lege query-uitkomst).")
-        st.stop()
-
-    # Geconfigureerde klanten (hebben laatste-run info)
+@st.cache_data(ttl=300, show_spinner="Klanten en analyses ophalen...")
+def _laad_klant_overzicht(_token_access: str):
+    """Bouw {klantnummer: {naam, analyses:[{id,code,naam}]}} uit de FA-config.
+    `_token_access` zit in de cache-key zodat een nieuwe login vers laadt."""
+    client = _client()
+    analyses = [a for a in client.list_all_analyses() if a.get("is_active")]
     klanten: dict[int, dict] = {}
-    for cfg in configs:
-        kn = cfg["klantnummer"]
-        if kn not in klanten:
-            klanten[kn] = {"klantnummer": kn, "analyses": []}
-        klanten[kn]["analyses"].append(cfg)
+    for a in analyses:
+        for r in client.klanten_voor_analyse(a["id"]):
+            if not r.get("enabled"):
+                continue
+            kn = r["klantnummer"]
+            entry = klanten.setdefault(kn, {"klantnummer": kn, "naam": "", "analyses": []})
+            entry["analyses"].append({"id": a["id"], "code": a["code"], "naam": a["naam"]})
+            if not entry["naam"]:
+                naam = klant_naam(r.get("leesinstructie"))
+                if naam:
+                    entry["naam"] = naam
+    for entry in klanten.values():
+        entry["analyses"].sort(key=lambda x: x["naam"])
+    return klanten
 
-    # Klant namen ophalen
-    klant_namen = _load_klant_namen_alle()
 
-    def _klant_label(kn: int) -> str:
-        naam = klant_namen.get(kn)
-        return f"{kn} — {naam}" if naam else str(kn)
+def _client() -> FAClient:
+    return FAClient(st.session_state.token)
 
-    # Geconfigureerde klantnummers als dropdown-opties + "Andere klant"
-    geconfigureerde_kns = sorted(klanten.keys())
-    klant_opties = [_klant_label(kn) for kn in geconfigureerde_kns] + ["Andere klant..."]
 
-    col_left, col_right = st.columns([1, 1], gap="large")
+def klant_label(kn: int, naam: str) -> str:
+    return f"{kn} — {naam}" if naam else str(kn)
 
-    with col_left:
-        st.subheader("Stap 1 — Klant en analyse")
 
-        gekozen_klant_label = st.selectbox(
-            "Klant",
-            klant_opties,
-            key="klant_select",
-        )
+# ---------------------------------------------------------------------------
+# Uitvoering: (tijdelijk ontvangers zetten →) run → deliver → verzenden
+# ---------------------------------------------------------------------------
 
-        if gekozen_klant_label == "Andere klant...":
-            kn_input = st.number_input(
-                "Klantnummer",
-                min_value=1000, max_value=9999, step=1,
-                value=1200,
-                key="klant_custom",
-                help="Voer een willekeurig klantnummer in",
+def voer_uit(*, client: FAClient, klantnummer: int, analyse: dict,
+             cfg_rij: dict, doel_emails: list[str] | None):
+    """Draait de analyse en verstuurt. doel_emails=None → standaard ontvangers.
+    Bij een override zetten we delivery_ontvangers tijdelijk en herstellen daarna."""
+    analyse_id = analyse["id"]
+    origineel = cfg_rij.get("delivery_ontvangers") or []
+    moet_herstellen = False
+
+    status = st.status("Bezig...", expanded=True)
+    try:
+        if doel_emails is not None:
+            status.write(f"✉️ Ontvangers tijdelijk instellen: {', '.join(doel_emails)}")
+            client.set_klant_config(
+                klantnummer=klantnummer, analyse_id=analyse_id,
+                enabled=bool(cfg_rij.get("enabled", True)),
+                leesinstructie=cfg_rij.get("leesinstructie"),
+                sql_overrides=cfg_rij.get("sql_overrides"),
+                delivery_ontvangers=maak_ontvangers(doel_emails),
             )
-            gekozen_kn = int(kn_input)
-            klant_info = None
-            geconfigureerde_analyse_ids = set()
-        else:
-            gekozen_kn = int(gekozen_klant_label.split(" — ")[0].split()[0])
-            klant_info = klanten.get(gekozen_kn)
-            geconfigureerde_analyse_ids = {a["analyse_id"] for a in klant_info["analyses"]} if klant_info else set()
+            moet_herstellen = True
 
-        # Analyses: alle analyses (stabiele labels, onafhankelijk van klant)
-        analyse_opties_map = {a["analyse_naam"]: a for a in alle_analyses}
-        analyse_labels = list(analyse_opties_map.keys())
-        gekozen_analyse_naam_sel = st.selectbox(
-            "Analyse",
-            analyse_labels,
-            key="analyse_select_v2",
-        )
-        # Guard: stale session state kan None opleveren
-        if not gekozen_analyse_naam_sel or gekozen_analyse_naam_sel not in analyse_opties_map:
-            gekozen_analyse_naam_sel = analyse_labels[0]
-        gekozen_analyse = analyse_opties_map[gekozen_analyse_naam_sel]
+        status.write("📥 Analyse draaien (DWH + Claude)... dit duurt ~1 min")
+        run = client.run(klantnummer, analyse["code"])
+        run_id = run.get("run_id") or run.get("id")
+        if run.get("status") != "done" or not run_id:
+            raise FAError(f"Run niet voltooid: {run}")
+        status.write(f"✓ Run klaar ({run.get('tokens_out', '?')} tokens) — e-mail renderen")
 
-        # Toon of combo al geconfigureerd is
-        if str(gekozen_analyse["analyse_id"]) in geconfigureerde_analyse_ids:
-            st.caption("✓ Al geconfigureerd voor deze klant (standaard ontvangers beschikbaar)")
+        delivery = client.generate_delivery(run_id)
+        delivery_id = delivery.get("id")
+        payload = delivery.get("payload", {})
+        werkelijke_to = ontvangers_tekst(payload.get("to", []))
+        status.write(f"✓ E-mail gerenderd — verzenden naar: {werkelijke_to}")
 
-        # Status laatste run (alleen als geconfigureerde combo)
-        laatste_run = None
-        if klant_info:
-            cfg_match = next(
-                (a for a in klant_info["analyses"] if str(a["analyse_id"]) == str(gekozen_analyse["analyse_id"])),
-                None,
-            )
-            if cfg_match:
-                laatste_run = cfg_match.get("laatste_run_datum")
+        send = client.send_delivery(delivery_id)
+        if not send.get("success"):
+            raise FAError(f"Verzenden mislukt: {send.get('error_message') or send}")
 
-        if laatste_run:
-            days = (datetime.utcnow() - laatste_run.replace(tzinfo=None)).days
-            if days <= 3:
-                kleur, icoon = "#d1fae5", "✓"
-            elif days <= 14:
-                kleur, icoon = "#fef9c3", "⚠"
-            else:
-                kleur, icoon = "#fee2e2", "⚠"
-            st.markdown(
-                f"""<div style="background:{kleur};padding:10px 14px;border-radius:8px;
-                              font-size:0.85rem;margin-top:8px">
-                  {icoon} Laatste run: <strong>{_format_datum(laatste_run)}</strong>
-                </div>""",
-                unsafe_allow_html=True,
-            )
-        else:
-            label_msg = "Nog geen eerdere run voor deze combinatie" if klant_info else "Nieuwe combinatie — geen eerdere run"
-            st.markdown(
-                f"""<div style="background:#f3f4f6;padding:10px 14px;border-radius:8px;
-                              font-size:0.85rem;margin-top:8px;color:#666">
-                  {label_msg}
-                </div>""",
-                unsafe_allow_html=True,
-            )
+        status.update(label="✅ Verzonden!", state="complete")
+        return {"run_id": run_id, "delivery_id": delivery_id,
+                "payload": payload, "to": werkelijke_to}
+    except Exception:
+        status.update(label="❌ Mislukt", state="error")
+        raise
+    finally:
+        if moet_herstellen:
+            try:
+                client.set_klant_config(
+                    klantnummer=klantnummer, analyse_id=analyse_id,
+                    enabled=bool(cfg_rij.get("enabled", True)),
+                    leesinstructie=cfg_rij.get("leesinstructie"),
+                    sql_overrides=cfg_rij.get("sql_overrides"),
+                    delivery_ontvangers=origineel,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"Let op: standaard ontvangers terugzetten mislukte ({exc}). "
+                           f"Controleer de klant-config in de FA-app.")
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("Volgende →", type="primary", use_container_width=True):
-            # Haal config op (met fallback op analyse-defaults als geen klant_analyse_config)
-            geconfigureerde_combo = cfg_match if (klant_info and cfg_match) else None
-            resolved_naam = klant_namen.get(gekozen_kn, f"Klant {gekozen_kn}")
-            st.session_state.geselecteerd = {
-                "klantnummer": gekozen_kn,
-                "klant_naam": resolved_naam,
-                "analyse_id": str(gekozen_analyse["analyse_id"]),
-                "analyse_naam": gekozen_analyse["analyse_naam"],
-                "config": geconfigureerde_combo or {},
-            }
-            st.session_state.stap = 2
-            st.session_state.error = None
+
+# ---------------------------------------------------------------------------
+# Hoofdscherm
+# ---------------------------------------------------------------------------
+
+def hoofdscherm():
+    header()
+    client = _client()
+
+    top_l, top_r = st.columns([4, 1])
+    with top_r:
+        st.caption(f"Ingelogd: {st.session_state.get('user_email','?')}")
+        if st.button("Uitloggen", use_container_width=True):
+            for k in ("token", "user_email"):
+                st.session_state.pop(k, None)
+            st.cache_data.clear()
             st.rerun()
 
-    with col_right:
-        st.subheader("Geconfigureerde klanten")
-        for kn in sorted(klanten.keys()):
-            k = klanten[kn]
-            with st.expander(_klant_label(kn), expanded=(kn == gekozen_kn if gekozen_klant_label != "Andere klant..." else False)):
-                for a in k["analyses"]:
-                    laatste = _format_datum(a.get("laatste_run_datum"))
-                    st.markdown(
-                        f"**{a['analyse_naam']}**  \n"
-                        f"<span style='font-size:0.8rem;color:#666'>Laatste run: {laatste}</span>",
-                        unsafe_allow_html=True,
-                    )
+    try:
+        klanten = _laad_klant_overzicht(client.access_token)
+    except FAError as exc:
+        st.error(f"Kan FA-gegevens niet laden: {exc}")
+        if "403" in str(exc):
+            st.info("Je account heeft mogelijk geen medewerker-rechten in de FA-app. "
+                    "Vraag Mark om `is_notifica_employee`.")
+        return
 
+    if not klanten:
+        st.warning("Geen geconfigureerde klanten gevonden.")
+        return
 
-# ---------------------------------------------------------------------------
-# Stap 2 — Ontvangers + bevestiging
-# ---------------------------------------------------------------------------
-
-elif st.session_state.stap == 2:
-    sel = st.session_state.geselecteerd
-
-    # Terug-knop
-    if st.button("← Terug"):
-        st.session_state.stap = 1
-        st.rerun()
-
-    st.subheader(f"Stap 2 — Ontvangers: {sel['klant_naam']} / {sel['analyse_naam']}")
-
-    standaard_ontvangers = _parse_ontvangers(sel["config"])
-
+    st.subheader("1 — Klant en analyse")
     col_l, col_r = st.columns([1, 1], gap="large")
 
     with col_l:
-        st.markdown("**Standaard ontvangers** (uit klantconfiguratie in FA app)")
-        if standaard_ontvangers:
-            for email in standaard_ontvangers:
-                st.code(email, language=None)
-        else:
-            st.caption("Geen standaard ontvangers ingesteld.")
-
-        st.markdown("---")
-        st.markdown("**Vervangende of extra ontvangers**")
-        st.caption(
-            "Leeg laten = gebruik standaard ontvangers. "
-            "Ingevuld = gebruik ALLEEN deze adressen."
+        kns = sorted(klanten.keys())
+        keuze = st.selectbox(
+            "Klant",
+            kns,
+            format_func=lambda kn: klant_label(kn, klanten[kn]["naam"]),
         )
-        extra_input = st.text_area(
-            "E-mailadressen (één per regel)",
-            placeholder="arthur@notifica.nl\ncontact@klant.nl",
-            height=110,
-            key="extra_emails",
-            label_visibility="collapsed",
+        klant = klanten[keuze]
+        analyse_opties = klant["analyses"]
+        analyse_naam = st.selectbox(
+            "Analyse",
+            [a["naam"] for a in analyse_opties],
         )
-        extra_emails = [e.strip() for e in extra_input.splitlines() if e.strip()]
+        analyse = next(a for a in analyse_opties if a["naam"] == analyse_naam)
 
-        uiteindelijk = extra_emails if extra_emails else standaard_ontvangers
-
-        if uiteindelijk:
-            st.success(f"Wordt verzonden naar: {', '.join(uiteindelijk)}")
-        else:
-            st.error("Geen ontvangers ingesteld — vul minimaal één e-mailadres in.")
+    # Config-rij (ontvangers + leesinstructie + sql_overrides) voor deze combo
+    cfg = client.klant_config(keuze)
+    cfg_rij = next((r for r in cfg if str(r.get("analyse_id")) == str(analyse["id"])), {})
+    standaard = cfg_rij.get("delivery_ontvangers") or []
 
     with col_r:
-        st.markdown("**Opties**")
-
-        run_mode = st.radio(
-            "Uitvoeringsmodus",
-            ["Nieuwe analyse uitvoeren (huidige data)", "Laatste run hergebruiken (snel)"],
-            index=0,
-            key="run_mode",
-        )
-        fresh_run = run_mode.startswith("Nieuwe")
-
-        if not fresh_run and not sel["config"].get("laatste_run_id"):
-            st.warning("Geen eerdere run beschikbaar — nieuwe run is vereist.")
-            fresh_run = True
-
-        st.markdown("---")
-
-        col_test, col_go = st.columns(2)
-        with col_test:
-            test_btn = st.button(
-                "🧪 Testmail → info@",
-                disabled=not uiteindelijk,
-                use_container_width=True,
-                help="Verzendt naar info@notifica.nl als test",
-            )
-        with col_go:
-            go_btn = st.button(
-                "🚀 Uitvoeren & Versturen",
-                type="primary",
-                disabled=not uiteindelijk,
-                use_container_width=True,
-            )
-
-    # ---------------------------------------------------------------------------
-    # Uitvoering
-    # ---------------------------------------------------------------------------
-
-    def _do_run(klantnummer, analyse_id, to_list, test_mode=False, fresh=True):
-        """Voert de pipeline uit en verstuurt de e-mail. Geeft result-dict terug."""
-        sel_info = st.session_state.geselecteerd
-
-        if fresh:
-            with st.status("Analyse uitvoeren...", expanded=True) as status:
-                st.write("📥 Data ophalen uit DWH via Notifica API...")
-                try:
-                    run_result = pipeline.run_analyse(klantnummer, analyse_id, sla_op=True)
-                except Exception as exc:
-                    status.update(label="❌ Fout bij analyse", state="error")
-                    raise
-
-                st.write(f"✓ {run_result['snapshot'].get('row_count', '?')} rijen verwerkt")
-                st.write("🤖 Analyse genereren via Claude...")
-                # (al gedaan in run_analyse)
-
-                st.write("✉️ E-mail renderen...")
-                config_full = fa_db.get_analyse_config(klantnummer, analyse_id)
-
-                try:
-                    mail_result = mailer.render_and_send(
-                        config=config_full,
-                        output_json=run_result["output_json"],
-                        klant_naam=run_result["klant_naam"],
-                        to=["info@notifica.nl"] if test_mode else to_list,
-                        test_mode=test_mode,
-                    )
-                except Exception as exc:
-                    status.update(label="❌ Fout bij verzenden", state="error")
-                    raise
-
-                status.update(label="✅ Klaar!", state="complete")
-                return {**run_result, "mail": mail_result, "test_mode": test_mode}
-
+        st.markdown("**Standaard ontvangers** (uit de FA-config)")
+        if standaard:
+            for o in standaard:
+                st.code(o.get("email", ""), language=None)
         else:
-            # Hergebruik laatste run
-            with st.status("Laatste run ophalen en verzenden...", expanded=True) as status:
-                st.write("📂 Laatste run ophalen...")
-                last = fa_db.get_laatste_run_output(klantnummer, analyse_id)
-                if not last:
-                    status.update(label="❌ Geen run gevonden", state="error")
-                    raise ValueError("Geen eerdere run beschikbaar")
+            st.caption("Geen standaard ontvangers ingesteld — vul hieronder een adres in.")
 
-                output_json = last.get("output_json") or {}
-                if isinstance(output_json, str):
-                    output_json = json.loads(output_json)
+    st.divider()
+    st.subheader("2 — Verzenden")
 
-                st.write("✉️ E-mail renderen...")
-                config_full = fa_db.get_analyse_config(klantnummer, analyse_id)
-                klant_naam = _load_klant_naam(klantnummer)
-
-                mail_result = mailer.render_and_send(
-                    config=config_full,
-                    output_json=output_json,
-                    klant_naam=klant_naam,
-                    to=["info@notifica.nl"] if test_mode else to_list,
-                    test_mode=test_mode,
-                )
-                status.update(label="✅ Klaar!", state="complete")
-                return {
-                    "run_id": str(last["run_id"]),
-                    "output_json": output_json,
-                    "klant_naam": klant_naam,
-                    "mail": mail_result,
-                    "test_mode": test_mode,
-                }
-
-    if test_btn:
-        try:
-            result = _do_run(
-                sel["klantnummer"], sel["analyse_id"],
-                to_list=uiteindelijk,
-                test_mode=True,
-                fresh=fresh_run,
-            )
-            st.success("Testmail verzonden naar info@notifica.nl")
-            with st.expander("E-mail preview"):
-                st.components.v1.html(result["mail"]["html_body"], height=600, scrolling=True)
-        except Exception as exc:
-            st.error(f"Fout: {exc}")
-
-    if go_btn:
-        try:
-            result = _do_run(
-                sel["klantnummer"], sel["analyse_id"],
-                to_list=uiteindelijk,
-                test_mode=False,
-                fresh=fresh_run,
-            )
-            st.session_state.run_result = result
-            st.session_state.stap = 3
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Fout: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Stap 3 — Resultaat
-# ---------------------------------------------------------------------------
-
-elif st.session_state.stap == 3:
-    result = st.session_state.run_result
-    sel = st.session_state.geselecteerd
-
-    st.success(
-        f"✅ Analyse verstuurd naar {', '.join(result['mail']['to'])}",
-        icon="📬",
+    st.markdown("**Vervangende ontvangers** (optioneel)")
+    st.caption(
+        "Leeg laten → de **standaard ontvangers** hierboven. "
+        "Ingevuld → wij sturen **alleen** naar deze adressen (de config wordt "
+        "tijdelijk aangepast en daarna teruggezet)."
     )
+    override_raw = st.text_area(
+        "E-mailadressen (één per regel of komma-gescheiden)",
+        placeholder="contactpersoon@klant.nl",
+        height=90,
+        label_visibility="collapsed",
+    )
+    override = parse_emails(override_raw)
 
-    col_a, col_b = st.columns([1, 1], gap="large")
+    definitief = override if override else [o.get("email", "") for o in standaard if o.get("email")]
 
-    with col_a:
-        st.subheader("Samenvatting")
-        st.markdown(f"**Klant:** {result.get('klant_naam', sel['klant_naam'])}")
-        st.markdown(f"**Analyse:** {sel['analyse_naam']}")
-        st.markdown(f"**Ontvanger(s):** {', '.join(result['mail']['to'])}")
-        st.markdown(f"**Onderwerp:** {result['mail'].get('subject', '—')}")
-        if result.get("run_id"):
-            st.caption(f"Run ID: `{result['run_id']}`")
+    if definitief:
+        st.success(f"Wordt verzonden naar: {', '.join(definitief)}")
+    else:
+        st.error("Geen ontvangers — vul minimaal één adres in.")
 
-        st.markdown("---")
-        col_nieuw, col_home = st.columns(2)
-        with col_nieuw:
-            if st.button("Nog een analyse", use_container_width=True):
-                st.session_state.stap = 2
-                st.session_state.run_result = None
-                st.rerun()
-        with col_home:
-            if st.button("Andere klant / analyse", use_container_width=True, type="primary"):
-                st.session_state.stap = 1
-                st.session_state.geselecteerd = None
-                st.session_state.run_result = None
-                st.rerun()
+    col_test, col_go = st.columns(2)
+    with col_test:
+        test_klik = st.button(f"🧪 Testmail → {TEST_ADRES}", use_container_width=True)
+    with col_go:
+        go_klik = st.button("🚀 Uitvoeren & Versturen", type="primary",
+                            use_container_width=True, disabled=not definitief)
 
-    with col_b:
-        st.subheader("E-mail preview")
-        html_body = result["mail"].get("html_body", "")
-        if html_body:
-            st.components.v1.html(html_body, height=600, scrolling=True)
+    if test_klik or go_klik:
+        if test_klik:
+            doel = [TEST_ADRES]
         else:
-            st.caption("Geen preview beschikbaar")
+            # Override → die adressen; anders standaard (doel=None laat backend de config gebruiken)
+            doel = override if override else None
+        try:
+            result = voer_uit(client=client, klantnummer=keuze, analyse=analyse,
+                              cfg_rij=cfg_rij, doel_emails=doel)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Fout: {exc}")
+            return
+
+        st.success(f"✅ Verzonden naar {result['to']}")
+        with st.expander("E-mail preview", expanded=True):
+            st.caption(f"Onderwerp: {result['payload'].get('subject','—')}")
+            html = result["payload"].get("body_html", "")
+            if html:
+                st.components.v1.html(html, height=600, scrolling=True)
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+if "token" not in st.session_state:
+    login_scherm()
+else:
+    hoofdscherm()
