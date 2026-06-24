@@ -7,10 +7,12 @@ Alle zware logica (DWH-snapshot, Claude-analyse, e-mail/Resend) zit al in
 Mark's financiele-analyse backend in de notifica-app. Deze app roept die
 endpoints aan met een Supabase-employee-JWT (zelfde auth als de FA-React-app).
 """
+import base64
+import json
 import re
-import time
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 import fa_client
@@ -93,12 +95,108 @@ def header():
 # Login (Supabase — zelfde account als de financiele-analyse app)
 # ---------------------------------------------------------------------------
 
+DRAFT_DEFAULT_URL = "https://app.notifica.nl/apps/drafts/push-analyse-sender/"
+
+
+def _capture_ms_auth() -> bool:
+    """Vang een token op dat via ?ms_auth=... in de URL is gezet (Microsoft-sessie
+    of OAuth-redirect). Geeft True terug als er ingelogd is."""
+    tok = st.query_params.get("ms_auth")
+    if not tok:
+        return False
+    try:
+        pad = "=" * (-len(tok) % 4)
+        data = json.loads(base64.urlsafe_b64decode(tok + pad))
+        token = fa_client.token_from_pair(
+            data.get("access_token", ""), data.get("refresh_token", ""))
+        if token["access_token"]:
+            st.session_state.token = token
+            st.session_state.user_email = token["user"].get("email", "")
+    except Exception:
+        pass
+    st.query_params.clear()
+    st.rerun()
+    return True
+
+
+def _ms_login_component():
+    """JS: hergebruik bestaande Notifica-sessie (localStorage) óf start een verse
+    Microsoft-login. Geeft het token door aan Streamlit via ?ms_auth=..."""
+    html = """
+    <div style="font-family:Inter,sans-serif;">
+      <button id="reuse" style="display:none;width:100%;padding:11px;margin-bottom:8px;
+        background:#16136F;color:#fff;border:none;border-radius:8px;font-size:14px;
+        font-weight:600;cursor:pointer;">Doorgaan als <span id="em"></span></button>
+      <button id="mslogin" style="width:100%;padding:11px;background:#fff;color:#16136F;
+        border:1px solid #16136F;border-radius:8px;font-size:14px;font-weight:600;
+        cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;">
+        <svg width="16" height="16" viewBox="0 0 23 23"><path fill="#f25022" d="M1 1h10v10H1z"/>
+        <path fill="#7fba00" d="M12 1h10v10H12z"/><path fill="#00a4ef" d="M1 12h10v10H1z"/>
+        <path fill="#ffb900" d="M12 12h10v10H12z"/></svg>
+        Inloggen met Microsoft</button>
+      <p id="hint" style="margin:8px 0 0;font-size:12px;color:#888;"></p>
+    </div>
+    <script>
+    (function(){
+      var SUPABASE="%%SUPABASE%%", FALLBACK="%%REDIRECT%%";
+      function b64(o){var s=btoa(JSON.stringify(o));return s.replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
+      function reloadApp(token){
+        var w = (window.parent && window.parent!==window) ? window.parent : window;
+        try{ var base=w.location.href.split('#')[0].split('?')[0]; w.location.replace(base+'?ms_auth='+token); return; }catch(e){}
+        try{ var t=window.top; var b=t.location.href.split('#')[0].split('?')[0]; t.location.replace(b+'?ms_auth='+token);}catch(e){}
+      }
+      // 1) Microsoft OAuth-redirect kwam terug (tokens in de hash)
+      try{
+        var w=(window.parent&&window.parent!==window)?window.parent:window;
+        var h=w.location.hash||window.location.hash||'';
+        if(h.indexOf('access_token=')>=0){
+          var p=new URLSearchParams(h.substring(1));
+          var at=p.get('access_token'), rt=p.get('refresh_token')||'';
+          if(at){ reloadApp(b64({access_token:at,refresh_token:rt})); return; }
+        }
+      }catch(e){}
+      // 2) Bestaande Notifica-sessie (Microsoft) hergebruiken
+      try{
+        var raw=window.localStorage.getItem('notifica-auth');
+        if(raw){
+          var s=JSON.parse(raw);
+          var at=s.access_token||(s.currentSession&&s.currentSession.access_token);
+          var rt=s.refresh_token||(s.currentSession&&s.currentSession.refresh_token)||'';
+          var em=(s.user&&s.user.email)||(s.currentSession&&s.currentSession.user&&s.currentSession.user.email)||'';
+          if(at){
+            var b=document.getElementById('reuse');
+            document.getElementById('em').textContent=em||'je Microsoft-account';
+            b.style.display='block';
+            b.onclick=function(){ reloadApp(b64({access_token:at,refresh_token:rt})); };
+          }
+        }
+      }catch(e){}
+      // 3) Verse Microsoft-login (opent op topniveau; nodig buiten een bestaande sessie)
+      document.getElementById('mslogin').onclick=function(){
+        var rt;
+        try{ rt=window.top.location.href.split('#')[0].split('?')[0]; }catch(e){ rt=FALLBACK; }
+        if(!rt) rt=FALLBACK;
+        var url=SUPABASE+'/auth/v1/authorize?provider=azure&redirect_to='+encodeURIComponent(rt);
+        try{ window.top.location.href=url; }catch(e){ window.location.href=url; }
+      };
+    })();
+    </script>
+    """
+    html = html.replace("%%SUPABASE%%", fa_client.SUPABASE_URL).replace("%%REDIRECT%%", DRAFT_DEFAULT_URL)
+    components.html(html, height=130)
+
+
 def login_scherm():
     header()
     col_l, col_m, col_r = st.columns([1, 1.4, 1])
     with col_m:
         st.markdown(f"<h3 style='color:{NAVY}'>🔒 Inloggen</h3>", unsafe_allow_html=True)
         st.caption("Log in met je Notifica-account (zelfde als app.notifica.nl).")
+
+        _ms_login_component()
+
+        st.markdown("<p style='text-align:center;color:#aaa;font-size:13px;margin:6px 0'>of met e-mail</p>",
+                    unsafe_allow_html=True)
         email = st.text_input("E-mailadres", placeholder="arthur@notifica.nl")
         wachtwoord = st.text_input("Wachtwoord", type="password")
         if st.button("Inloggen", type="primary", use_container_width=True):
@@ -331,6 +429,7 @@ def hoofdscherm():
 # ---------------------------------------------------------------------------
 
 if "token" not in st.session_state:
+    _capture_ms_auth()  # vangt ?ms_auth=... op (Microsoft-sessie / OAuth-redirect)
     login_scherm()
 else:
     hoofdscherm()

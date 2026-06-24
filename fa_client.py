@@ -75,13 +75,29 @@ def _normalize_token(data: dict) -> dict:
     }
 
 
-def _jwt_exp(token: str) -> float:
+def _jwt_payload(token: str) -> dict:
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
-        return float(json.loads(base64.b64decode(payload)).get("exp", 0))
+        return json.loads(base64.b64decode(payload))
     except Exception:
-        return 0.0
+        return {}
+
+
+def _jwt_exp(token: str) -> float:
+    return float(_jwt_payload(token).get("exp", 0) or 0)
+
+
+def token_from_pair(access_token: str, refresh_token: str = "") -> dict:
+    """Bouw een token-object uit een (access, refresh) paar — bv. uit een
+    bestaande Supabase-sessie of een Microsoft OAuth-redirect."""
+    payload = _jwt_payload(access_token)
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token or "",
+        "expires_at": float(payload.get("exp", 0) or 0),
+        "user": {"email": payload.get("email", "")},
+    }
 
 
 # ---------------------------------------------------------------------------
