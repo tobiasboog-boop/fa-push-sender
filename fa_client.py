@@ -108,8 +108,9 @@ def token_from_pair(access_token: str, refresh_token: str = "") -> dict:
 class FAClient:
     """Roept de /api/fa/* endpoints aan met een (auto-refreshend) JWT-token."""
 
-    def __init__(self, token: dict):
+    def __init__(self, token: dict, on_refresh=None):
         self._token = token
+        self._on_refresh = on_refresh  # callback(token_dict) na elke refresh
 
     # -- token-beheer -------------------------------------------------------
     @property
@@ -117,6 +118,11 @@ class FAClient:
         if self._token.get("expires_at", 0) < time.time() + 60:
             if self._token.get("refresh_token"):
                 self._token = refresh(self._token["refresh_token"])
+                if self._on_refresh:
+                    try:
+                        self._on_refresh(self._token)
+                    except Exception:
+                        pass
         return self._token["access_token"]
 
     @property

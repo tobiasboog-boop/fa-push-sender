@@ -77,45 +77,58 @@ def header():
 # Login (Supabase — zelfde account als de financiele-analyse app)
 # ---------------------------------------------------------------------------
 
+_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".session_token")
+
+
+def _persist_token(token: dict):
+    """Bewaar het (geroteerde) refresh-token zodat het een herstart overleeft."""
+    try:
+        with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"refresh_token": token.get("refresh_token", "")}, f)
+    except Exception:
+        pass
+
+
+def _seed_refresh_token() -> str:
+    """Het meest recente refresh-token: eerst het gepersisteerde, anders de env-seed."""
+    try:
+        with open(_TOKEN_FILE, encoding="utf-8") as f:
+            rt = json.load(f).get("refresh_token", "").strip()
+            if rt:
+                return rt
+    except Exception:
+        pass
+    return os.environ.get("FA_REFRESH_TOKEN", "").strip()
+
+
+@st.cache_resource(show_spinner="Sessie opzetten...")
+def _service_client():
+    """Eén gedeelde service-sessie voor het hele app-proces (niet per bezoeker).
+    Voorkomt dat parallelle sessies hetzelfde refresh-token hergebruiken — dat
+    triggert Supabase's reuse-detectie en trekt de sessie in."""
+    rt = _seed_refresh_token()
+    if not rt:
+        return None, "App niet geconfigureerd: zet FA_REFRESH_TOKEN in de env."
+    try:
+        token = fa_client.refresh(rt)
+    except FAError as exc:
+        return None, f"Service-sessie verlopen — vernieuw FA_REFRESH_TOKEN: {exc}"
+    _persist_token(token)
+    client = FAClient(token, on_refresh=_persist_token)
+    return client, None
+
+
 def _ensure_session():
-    """Authenticeer de app op de achtergrond met een vaste service-login uit de env.
-    Geen login-scherm: toegang wordt afgeschermd door het Notifica-platform (de
-    draft is alleen bereikbaar voor ingelogde medewerkers)."""
-    tok = st.session_state.get("token")
-    if tok and tok.get("access_token"):
-        return
-
-    # Primair: vast refresh-token (captcha-vrij; Supabase-wachtwoordlogin is door
-    # Cloudflare Turnstile geblokkeerd voor server-side gebruik).
-    rt = os.environ.get("FA_REFRESH_TOKEN", "").strip()
-    if rt:
-        try:
-            token = fa_client.refresh(rt)
-        except FAError as exc:
-            header()
-            st.error(f"Service-sessie verlopen — vernieuw FA_REFRESH_TOKEN: {exc}")
-            st.stop()
-        st.session_state.token = token
-        st.session_state.user_email = (token.get("user") or {}).get("email", "")
-        return
-
-    # Fallback: wachtwoordlogin (werkt alleen als captcha uit staat).
-    email = os.environ.get("FA_LOGIN_EMAIL", "").strip()
-    pw = os.environ.get("FA_LOGIN_PASSWORD", "")
-    if email and pw:
-        try:
-            token = fa_client.login(email, pw)
-        except FAError as exc:
-            header()
-            st.error(f"Service-login mislukt: {exc}")
-            st.stop()
-        st.session_state.token = token
-        st.session_state.user_email = (token.get("user") or {}).get("email", email)
-        return
-
-    header()
-    st.error("App niet geconfigureerd: zet FA_REFRESH_TOKEN in de env.")
-    st.stop()
+    """Zet de gedeelde service-sessie klaar. Geen login-scherm: toegang wordt
+    afgeschermd door het Notifica-platform (draft alleen voor ingelogde medewerkers)."""
+    client, err = _service_client()
+    if err:
+        header()
+        st.error(err)
+        if "verlopen" in err:
+            st.caption("Vraag Tobias om een vers refresh-token te zetten.")
+        st.stop()
+    st.session_state.user_email = (client.token.get("user") or {}).get("email", "")
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +154,8 @@ def _laad_runnable(_token_access: str) -> list:
 
 
 def _client() -> FAClient:
-    return FAClient(st.session_state.token)
+    client, _ = _service_client()
+    return client
 
 
 def klant_label(kn: int, naam: str) -> str:
@@ -259,10 +273,17 @@ def hoofdscherm():
             help="Alle organisaties — ook klanten waarvoor een analyse nog niet is geactiveerd.",
         )
         # Alle actieve analyses + of ze al aan staan voor deze klant,
-        # gefilterd op analyses die echt uitvoerbaar zijn (data-definitie aanwezig)
+        # gefilterd op uitvoerbare analyses (data-definitie aanwezig) en zonder
+        # Marks test-varianten.
+        def _verborgen(r):
+            code = (r.get("analyse_code") or "").lower()
+            naam = (r.get("analyse_naam") or "").lower()
+            return "mark-test" in code or "mark test" in naam
+
         runnable = set(_laad_runnable(client.access_token))
         cfg_all = _laad_klant_config(client.access_token, keuze)
-        cfg = [r for r in cfg_all if str(r.get("analyse_id")) in runnable]
+        cfg = [r for r in cfg_all
+               if str(r.get("analyse_id")) in runnable and not _verborgen(r)]
         if not cfg:
             st.warning("Geen uitvoerbare analyses beschikbaar voor deze klant.")
             return
