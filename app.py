@@ -7,12 +7,10 @@ Alle zware logica (DWH-snapshot, Claude-analyse, e-mail/Resend) zit al in
 Mark's financiele-analyse backend in de notifica-app. Deze app roept die
 endpoints aan met een Supabase-employee-JWT (zelfde auth als de FA-React-app).
 """
-import base64
-import json
+import os
 import re
 
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 import fa_client
@@ -95,142 +93,43 @@ def header():
 # Login (Supabase — zelfde account als de financiele-analyse app)
 # ---------------------------------------------------------------------------
 
-DRAFT_DEFAULT_URL = "https://app.notifica.nl/apps/drafts/push-analyse-sender/"
+def _ensure_session():
+    """Authenticeer de app op de achtergrond met een vaste service-login uit de env.
+    Geen login-scherm: toegang wordt afgeschermd door het Notifica-platform (de
+    draft is alleen bereikbaar voor ingelogde medewerkers)."""
+    tok = st.session_state.get("token")
+    if tok and tok.get("access_token"):
+        return
 
+    email = os.environ.get("FA_LOGIN_EMAIL", "").strip()
+    pw = os.environ.get("FA_LOGIN_PASSWORD", "")
+    if email and pw:
+        try:
+            token = fa_client.login(email, pw)
+        except FAError as exc:
+            header()
+            st.error(f"Service-login mislukt: {exc}")
+            st.stop()
+        st.session_state.token = token
+        st.session_state.user_email = (token.get("user") or {}).get("email", email)
+        return
 
-def _capture_ms_auth() -> bool:
-    """Vang een token op dat via ?ms_auth=... in de URL is gezet (Microsoft-sessie
-    of OAuth-redirect). Geeft True terug als er ingelogd is."""
-    tok = st.query_params.get("ms_auth")
-    if not tok:
-        return False
-    try:
-        pad = "=" * (-len(tok) % 4)
-        data = json.loads(base64.urlsafe_b64decode(tok + pad))
-        token = fa_client.token_from_pair(
-            data.get("access_token", ""), data.get("refresh_token", ""))
-        if token["access_token"]:
-            st.session_state.token = token
-            st.session_state.user_email = token["user"].get("email", "")
-    except Exception:
-        pass
-    st.query_params.clear()
-    st.rerun()
-    return True
+    # Fallback: vaste refresh-token uit de env
+    rt = os.environ.get("FA_REFRESH_TOKEN", "").strip()
+    if rt:
+        try:
+            token = fa_client.refresh(rt)
+        except FAError as exc:
+            header()
+            st.error(f"Service-sessie verlopen: {exc}")
+            st.stop()
+        st.session_state.token = token
+        st.session_state.user_email = (token.get("user") or {}).get("email", "")
+        return
 
-
-def _ms_login_component():
-    """JS: hergebruik bestaande Notifica-sessie (localStorage) óf start een verse
-    Microsoft-login. Geeft het token door aan Streamlit via ?ms_auth=..."""
-    html = """
-    <div style="font-family:Inter,sans-serif;">
-      <button id="reuse" style="display:none;width:100%;padding:11px;margin-bottom:8px;
-        background:#16136F;color:#fff;border:none;border-radius:8px;font-size:14px;
-        font-weight:600;cursor:pointer;">Doorgaan als <span id="em"></span></button>
-      <button id="mslogin" style="width:100%;padding:11px;background:#fff;color:#16136F;
-        border:1px solid #16136F;border-radius:8px;font-size:14px;font-weight:600;
-        cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;">
-        <svg width="16" height="16" viewBox="0 0 23 23"><path fill="#f25022" d="M1 1h10v10H1z"/>
-        <path fill="#7fba00" d="M12 1h10v10H12z"/><path fill="#00a4ef" d="M1 12h10v10H1z"/>
-        <path fill="#ffb900" d="M12 12h10v10H12z"/></svg>
-        Inloggen met Microsoft</button>
-      <p id="hint" style="margin:8px 0 0;font-size:12px;color:#888;"></p>
-    </div>
-    <script>
-    (function(){
-      var SUPABASE="%%SUPABASE%%", FALLBACK="%%REDIRECT%%";
-      function b64(o){var s=btoa(JSON.stringify(o));return s.replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
-      // Same-origin frames waarin de Notifica-sessie kan staan
-      function stores(){ var a=[]; try{a.push(window.localStorage);}catch(e){} try{if(window.parent&&window.parent!==window)a.push(window.parent.localStorage);}catch(e){} try{if(window.top&&window.top!==window)a.push(window.top.localStorage);}catch(e){} return a; }
-      function findSession(){
-        var ss=stores();
-        for(var i=0;i<ss.length;i++){
-          try{ var raw=ss[i].getItem('notifica-auth'); if(!raw) continue;
-            var s=JSON.parse(raw);
-            var at=s.access_token||(s.currentSession&&s.currentSession.access_token);
-            var rt=s.refresh_token||(s.currentSession&&s.currentSession.refresh_token)||'';
-            var em=(s.user&&s.user.email)||(s.currentSession&&s.currentSession.user&&s.currentSession.user.email)||'';
-            if(at) return {at:at,rt:rt,em:em};
-          }catch(e){}
-        }
-        return null;
-      }
-      function reloadApp(token){
-        // Streamlit-app (parent) of top herladen met ?ms_auth — same-origin, dus toegestaan
-        var targets=[]; try{if(window.parent&&window.parent!==window)targets.push(window.parent);}catch(e){} try{if(window.top&&window.top!==window)targets.push(window.top);}catch(e){} targets.push(window);
-        for(var i=0;i<targets.length;i++){
-          try{ var base=targets[i].location.href.split('#')[0].split('?')[0]; targets[i].location.replace(base+'?ms_auth='+token); return true; }catch(e){}
-        }
-        return false;
-      }
-      function useSession(sess){ return reloadApp(b64({access_token:sess.at,refresh_token:sess.rt})); }
-
-      // 1) Microsoft OAuth-redirect kwam terug in DIT tabblad (tokens in de hash)
-      try{
-        var hw=(window.parent&&window.parent!==window)?window.parent:window;
-        var h=''; try{h=hw.location.hash||'';}catch(e){h=window.location.hash||'';}
-        if(h.indexOf('access_token=')>=0){
-          var p=new URLSearchParams(h.substring(1));
-          var at=p.get('access_token'), rt=p.get('refresh_token')||'';
-          if(at){ reloadApp(b64({access_token:at,refresh_token:rt})); return; }
-        }
-      }catch(e){}
-
-      // 2) Bestaande Notifica-sessie (Microsoft) hergebruiken
-      var sess=findSession();
-      if(sess){
-        var b=document.getElementById('reuse');
-        document.getElementById('em').textContent=sess.em||'je Microsoft-account';
-        b.style.display='block';
-        b.onclick=function(){ if(!useSession(findSession()||sess)) document.getElementById('hint').textContent='Kon de sessie niet doorgeven — gebruik e-mail/wachtwoord.'; };
-      }
-
-      // 3) Verse Microsoft-login: opent in NIEUW TABBLAD (Microsoft kan niet in een iframe)
-      document.getElementById('mslogin').onclick=function(){
-        var rt; try{ rt=window.top.location.href.split('#')[0].split('?')[0]; }catch(e){ rt=FALLBACK; }
-        if(!rt) rt=FALLBACK;
-        var url=SUPABASE+'/auth/v1/authorize?provider=azure&redirect_to='+encodeURIComponent(rt);
-        window.open(url,'_blank');
-        document.getElementById('hint').textContent='Microsoft opent in een nieuw tabblad. Log daar in; hier verschijnt dan automatisch een knop om door te gaan.';
-        // Poll op de nieuw verkregen sessie (max ~2 min)
-        var tries=0, iv=setInterval(function(){
-          tries++; var s=findSession();
-          if(s){ clearInterval(iv); useSession(s); }
-          else if(tries>80){ clearInterval(iv); }
-        },1500);
-      };
-    })();
-    </script>
-    """
-    html = html.replace("%%SUPABASE%%", fa_client.SUPABASE_URL).replace("%%REDIRECT%%", DRAFT_DEFAULT_URL)
-    components.html(html, height=130)
-
-
-def login_scherm():
     header()
-    col_l, col_m, col_r = st.columns([1, 1.4, 1])
-    with col_m:
-        st.markdown(f"<h3 style='color:{NAVY}'>🔒 Inloggen</h3>", unsafe_allow_html=True)
-        st.caption("Log in met je Notifica-account (zelfde als app.notifica.nl).")
-
-        _ms_login_component()
-
-        st.markdown("<p style='text-align:center;color:#aaa;font-size:13px;margin:6px 0'>of met e-mail</p>",
-                    unsafe_allow_html=True)
-        email = st.text_input("E-mailadres", placeholder="arthur@notifica.nl")
-        wachtwoord = st.text_input("Wachtwoord", type="password")
-        if st.button("Inloggen", type="primary", use_container_width=True):
-            if not email or not wachtwoord:
-                st.error("Vul e-mailadres en wachtwoord in.")
-                return
-            try:
-                token = fa_client.login(email.strip(), wachtwoord)
-            except FAError as exc:
-                st.error(str(exc))
-                return
-            st.session_state.token = token
-            st.session_state.user_email = (token.get("user") or {}).get("email", email.strip())
-            st.rerun()
+    st.error("App niet geconfigureerd: zet FA_LOGIN_EMAIL + FA_LOGIN_PASSWORD in de env.")
+    st.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -341,12 +240,7 @@ def hoofdscherm():
 
     top_l, top_r = st.columns([4, 1])
     with top_r:
-        st.caption(f"Ingelogd: {st.session_state.get('user_email','?')}")
-        if st.button("Uitloggen", use_container_width=True):
-            for k in ("token", "user_email"):
-                st.session_state.pop(k, None)
-            st.cache_data.clear()
-            st.rerun()
+        st.caption(f"Service: {st.session_state.get('user_email','?')}")
 
     try:
         klanten = _laad_klant_overzicht(client.access_token)
@@ -448,8 +342,5 @@ def hoofdscherm():
 # Router
 # ---------------------------------------------------------------------------
 
-if "token" not in st.session_state:
-    _capture_ms_auth()  # vangt ?ms_auth=... op (Microsoft-sessie / OAuth-redirect)
-    login_scherm()
-else:
-    hoofdscherm()
+_ensure_session()
+hoofdscherm()
